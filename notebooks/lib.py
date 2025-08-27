@@ -15,6 +15,9 @@ class Bank:
     bucket_usage_count: dict = {}
 
     def __init__(self, initial_capital, number_of_buckets = 10) -> None:
+        self.residue.clear()
+        self.snapshot.clear()
+        self.bucket_usage_count.clear()
         self.initial_capital = initial_capital
         self.ids = [str(uuid1()).split('-')[0] for i in range(number_of_buckets)]
         self.buckets = dict(zip(self.ids, [initial_capital/number_of_buckets] * number_of_buckets))
