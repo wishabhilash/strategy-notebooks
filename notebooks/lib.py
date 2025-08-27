@@ -73,6 +73,7 @@ class Position:
     mtf_rate_daily: float = 0.0192 / 100
     tp_perc: float = 3.0
     sl_perc: float = 1.0
+    max_mtf_days: int = 100
 
     def exit_margin(self):
         return (self.exit_price * self.quantity)/self.leverage - self.tax
@@ -101,7 +102,7 @@ class Position:
 
         # --- Add MTF charge ---
         holding_days = (self.exit_time - self.entry_time).days
-        holding_days = min(holding_days, 100)
+        holding_days = min(holding_days, self.max_mtf_days)
         mtf_funded_amount = self.avg_entry_price * self.quantity * (self.leverage - 1) / self.leverage
         mtf_charge = mtf_funded_amount * self.mtf_rate_daily * holding_days
 
