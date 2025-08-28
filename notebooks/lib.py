@@ -22,20 +22,31 @@ class Bank:
         self.ids = [str(uuid1()).split('-')[0] for i in range(number_of_buckets)]
         self.buckets = dict(zip(self.ids, [initial_capital/number_of_buckets] * number_of_buckets))
 
-    def borrow(self) -> tuple:
+    def borrow(self, capital_request=None) -> tuple:
         if len(self.buckets) == 0:
             return None, None
         
         _df = pd.DataFrame(self.buckets.items(), columns=['key', 'amount']).sort_values('amount', ascending=True)
         key = _df.iloc[0].key
-        bucket_amount = self.buckets.pop(key)
+
+        if capital_request is not None and _df.iloc[0].amount > capital_request:
+            self.buckets[key] -= capital_request
+            bucket_amount = capital_request
+        else:
+            bucket_amount = self.buckets.pop(key)
 
         self.bucket_usage_count[key] = self.bucket_usage_count.get(key, 0) + 1
         self._take_snapshot()
         return key, bucket_amount
     
+    def balance(self):
+        return sum(self.buckets.values())
+    
     def save_residue(self, key, amount):
-        self.residue[key] = amount
+        if key not in self.residue:
+            self.residue[key] = amount
+        else:
+            self.residue[key] += amount
 
     def _take_snapshot(self):
         self.snapshot.append(copy(self.buckets))
@@ -44,8 +55,20 @@ class Bank:
         if key not in self.ids:
             raise Exception("invalid key")
         residue = self.residue.pop(key)
-        self.buckets[key] = amount + residue
+        if key in self.buckets:
+            self.buckets[key] += amount + residue
+        else:
+            self.buckets[key] = amount + residue
         self._take_snapshot()
+
+    def add_capital(self, amount):
+        key = str(uuid1()).split('-')[0]
+        self.ids.append(key)
+        self.buckets[key] = amount
+        return key
+    
+    def has_capital(self):
+        return len(self.buckets) > 0
 
 
 @dataclass
@@ -136,21 +159,35 @@ class PositionManager:
     leverage: int = 1
     mtf_rate_daily: float = 0.0192 / 100
 
-    def new_position(self, stock, entry_time, entry_price):
+    def new_position(self, stock, entry_time, entry_price, capital=None) -> Position | None:
         qty = 0
-        while True:    
-            key, capital = self.bank.borrow()
+        key = None
+
+        if capital is None:
+            while True:
+                key, capital = self.bank.borrow()
+                if key is None:
+                    print("No capital available")
+                    return None
+                
+                if capital <= 0:
+                    continue
+                break
+        else:
+            key, capital = self.bank.borrow(capital_request=capital)
             if key is None:
+                print("No capital available")
                 return None
-            
-            if capital <= 0:
-                continue
-            
+
+        try:
             qty = int(capital * self.leverage / entry_price)
-            
-            if qty == 0:
-                return None
-            break
+        except Exception as e:
+            print(e)
+            print(capital, entry_price, self.leverage)
+            return None
+        
+        if qty == 0:
+            return None
 
         position = Position(
             stock,
