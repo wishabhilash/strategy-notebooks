@@ -5,3 +5,6 @@ notebooks/cifar_net.pth
 *.txt
 *.csv
 .venv
+data
+data5m
+__pycache__

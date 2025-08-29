@@ -186,7 +186,8 @@ class PositionManager:
             print(capital, entry_price, self.leverage)
             return None
         
-        if qty == 0:
+        if qty <= 0:
+            print(f"invalid quantity - {qty}")
             return None
 
         position = Position(
