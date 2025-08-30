@@ -92,6 +92,7 @@ class Position:
     trades: List[Trade] = field(default_factory=list)
     pnl: float = 0.0
     tax: float = 0.0
+    mtf_charge: float = 0.0
     leverage: int = 1
     mtf_rate_daily: float = 0.0192 / 100
     tp_perc: float = 3.0
@@ -127,9 +128,9 @@ class Position:
         holding_days = (self.exit_time - self.entry_time).days
         holding_days = min(holding_days, self.max_mtf_days)
         mtf_funded_amount = self.avg_entry_price * self.quantity * (self.leverage - 1) / self.leverage
-        mtf_charge = mtf_funded_amount * self.mtf_rate_daily * holding_days
+        self.mtf_charge = mtf_funded_amount * self.mtf_rate_daily * holding_days
 
-        self.tax = extry_taxes + exit_taxes + mtf_charge
+        self.tax = extry_taxes + exit_taxes + self.mtf_charge
 
     def rebalance_position(self):
         total_cost = 0
