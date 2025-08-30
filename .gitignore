@@ -3,7 +3,6 @@ notebooks/cifar_net.pth
 .ipynb_checkpoints/
 *.log
 *.txt
-*.csv
 .venv
 data
 data5m
