@@ -6,4 +6,5 @@ notebooks/cifar_net.pth
 .venv
 data
 data5m
+data15m
 __pycache__
