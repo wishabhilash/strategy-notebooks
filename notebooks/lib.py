@@ -3,6 +3,10 @@ from typing import List
 import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import asdict
+from hyperopt import fmin, STATUS_OK, tpe
+import statistics
+import copy
+
 
 
 class Bank:
@@ -71,8 +75,6 @@ class Position:
     mtf_charge: float = 0.0
     leverage: int = 1
     mtf_rate_daily: float = 0.0192 / 100
-    tp_perc: float = 3.0
-    sl_perc: float = 1.0
     max_mtf_days: int = 100
     brokerage: float = 0.0
 
@@ -83,10 +85,9 @@ class Position:
         self.exit_time = exit_time
         self.exit_price = exit_price
         if self.quantity < 0:
-            print(self)
             raise Exception("Quantity can't be negative")
-        self.pnl = (exit_price - self.avg_entry_price) * self.quantity
         self.calculate_taxes()
+        self.pnl = (exit_price - self.avg_entry_price) * self.quantity - self.tax
 
     def calculate_taxes(self):
         extry_taxes = 0
@@ -125,8 +126,6 @@ class Position:
             print(self)
         self.avg_entry_price = total_cost / total_qty
         self.quantity = total_qty
-        self.tp = self.avg_entry_price * (1 + self.tp_perc / 100)
-        self.sl = self.avg_entry_price * (1 - self.sl_perc / 100)
         self.last_entry_price = self.trades[-1].entry_price if len(self.trades) > 0 else 0
 
     def add_trade(self, trade: Trade):
@@ -136,8 +135,6 @@ class Position:
 @dataclass
 class PositionManager:
     bank: Bank
-    tp_perc: float = 1
-    sl_perc: float = 1
     active_positions: dict = field(default_factory=dict)
     closed_positions: list = field(default_factory=list)
     leverage: int = 1
@@ -148,26 +145,20 @@ class PositionManager:
 
         capital = self.bank.borrow(capital)
         if capital <= 0:
-            print(f"capital not available - {capital}")
             return
 
         try:
             qty = round(capital * self.leverage / entry_price)
         except Exception as e:
-            print(e)
-            print(capital, entry_price, self.leverage)
             return None
         
         if qty <= 0:
-            print(f"invalid quantity - {qty}")
             return None
 
         position = Position(
             stock,
             entry_time,
             mtf_rate_daily=self.mtf_rate_daily,
-            tp_perc=self.tp_perc,
-            sl_perc=self.sl_perc,
             leverage=self.leverage
         )
         trade = Trade(entry_time, entry_price, qty)
@@ -192,7 +183,6 @@ class PositionManager:
         capital_required = entry_price * position.quantity
         capital = self.bank.borrow(capital_required)
         if capital <= 0:
-            print(f"capital not available - {capital}")
             return
         
         trade = Trade(entry_time, entry_price, position.quantity)
@@ -211,10 +201,12 @@ class PositionManager:
         return pd.DataFrame([asdict(p) for p in self.closed_positions]).sort_values(['entry_time']).reset_index(drop=True)
 
 
-def print_tearsheet(initial_capital, pm: PositionManager, trades: pd.DataFrame):
+def generate_tearsheet(initial_capital, pm: PositionManager):
+    trades = pm.get_trades()
     # Ensure entry_time and exit_time are datetime
     trades['entry_time'] = pd.to_datetime(trades['entry_time'])
     trades['exit_time'] = pd.to_datetime(trades['exit_time'])
+    trades['returns'] = (trades['pnl'] / (trades['avg_entry_price'] * trades['quantity']))
 
     # Total trades
     total_trades = len(trades)
@@ -224,7 +216,7 @@ def print_tearsheet(initial_capital, pm: PositionManager, trades: pd.DataFrame):
     win_rate = win_trades / total_trades * 100 if total_trades > 0 else 0
 
     # Total profit
-    total_profit = trades['pnl'].sum() - trades['tax'].sum()
+    total_profit = trades['pnl'].sum()
 
     # Total tax
     total_tax = trades['tax'].sum()
@@ -258,10 +250,11 @@ def print_tearsheet(initial_capital, pm: PositionManager, trades: pd.DataFrame):
 
 
     # Calculate drawdown
-    trades['cum_pnl'] = trades['pnl'].cumsum()
+    trades['cum_pnl'] = initial_capital + trades['pnl'].cumsum()
 
     trades['cum_max'] = trades['cum_pnl'].cummax()
     trades['drawdown'] = trades['cum_pnl'] - trades['cum_max']
+    trades['drawdown_pct'] = trades['drawdown'] / trades['cum_max'] * 100
     max_drawdown = trades['drawdown'].min()
     max_drawdown_pct = abs(max_drawdown) / trades['cum_max'].max() * 100 if trades['cum_max'].max() != 0 else 0
 
@@ -270,48 +263,28 @@ def print_tearsheet(initial_capital, pm: PositionManager, trades: pd.DataFrame):
     profit_factor = trades[trades['pnl'] > 0]['pnl'].sum() / abs(trades[trades['pnl'] < 0]['pnl'].sum()) if abs(trades[trades['pnl'] < 0]['pnl'].sum()) > 0 else None
 
     # Tearsheets summary
-    tearsheet = pd.DataFrame({
-        'Metric': [
-            'Period',
-            'Starting capital',
-            'Final capital',
-            'Total Trades',
-            'Winners',
-            'Losers',
-            'Profit factor',
-            'Active Position Count',
-            'Max holding period (days)',
-            'Avg holding period (days)',
-            'Win Rate (%)',
-            'Total Profit',
-            'Total Brokerage',
-            'Total Tax',
-            'Total MTF',
-            'CAGR (%)',
-            'Max Drawdown (%)'
-        ],
-        'Value': [
-            period,
-            f"{initial_capital:.2f}",
-            f"{final_capital:.2f}",
-            f"{total_trades:,}",
-            f"{number_of_wins:,}",
-            f"{number_of_losses:,}",
-            f"{profit_factor:.2f}" if profit_factor else "N/A",
-            f"{active_position_count:,}",
-            f"{max_holding_period:,}",
-            f"{avg_holding_period:,}",
-            f"{win_rate:.2f}",
-            f"{total_profit:,.2f}",
-            f"{total_brokerage:,.2f}",
-            f"{total_tax:.2f}" if total_tax else "N/A",
-            f"{total_mtf_charge:.2f}" if total_mtf_charge else "N/A",
-            f"{cagr:.2f}" if cagr else "N/A",
-            f"{max_drawdown_pct:,.2f}"
-        ]
-    })
-
-    print(tearsheet)
+    tearsheet = {
+        'Period': period,
+        'Starting capital': initial_capital,
+        'Final capital': final_capital,
+        'Total Trades': total_trades,
+        'Winners': number_of_wins,
+        'Losers': number_of_losses,
+        'Profit factor': profit_factor if profit_factor else "N/A",
+        'Active Position Count': active_position_count,
+        'Max holding period (days)': max_holding_period,
+        'Avg holding period (days)': avg_holding_period,
+        'Win Rate (%)': win_rate,
+        'Total Profit': total_profit,
+        'Total Brokerage': total_brokerage,
+        'Total Tax': total_tax if total_tax else "N/A",
+        'Total MTF': total_mtf_charge if total_mtf_charge else "N/A",
+        'CAGR (%)': cagr if cagr else "N/A",
+        'Max Drawdown (%):': max_drawdown_pct,
+        'Max Drawdown (%):': max_drawdown_pct
+    }
+    
+    return tearsheet, trades
 
 def show_equity_curve(trades: pd.DataFrame):
     trades = trades.sort_values(['exit_time']).reset_index(drop=True)
@@ -330,3 +303,69 @@ def show_equity_curve(trades: pd.DataFrame):
     plt.ylabel('Total PnL')
     plt.xticks(rotation=45)
     plt.show()
+
+
+def perturb_and_test(backtest_func, df, base_result, params, CONSTANT_PARAMS, perturb_pct=0.10):
+    base_metric = sum(base_result['returns']) / len(base_result['returns'])
+
+    bank = Bank(CONSTANT_PARAMS['initial_capital'])
+    pm = PositionManager(bank)
+    perturbed_metrics = []
+
+    for key, value in params.items():
+        if isinstance(value, (int, float)):
+            # Perturb down
+            down_params = copy.deepcopy(params)
+            down_params[key] = value * (1 - perturb_pct)
+            all_params = {**down_params, **CONSTANT_PARAMS}
+            _, down_results = backtest_func(df.copy(), pm, all_params)
+            metric_down = sum(down_results['returns']) / len(down_results['returns'])
+            perturbed_metrics.append(metric_down)
+
+            # Perturb up
+            up_params = copy.deepcopy(params)
+            up_params[key] = value * (1 + perturb_pct)
+            all_params = {**up_params, **CONSTANT_PARAMS}
+            _, up_results = backtest_func(df.copy(), pm, all_params)
+            metric_up = sum(up_results['returns']) / len(up_results['returns'])
+            perturbed_metrics.append(metric_up)
+
+    # Calculate penalty as std deviation of base + perturbed metrics
+    metrics = [base_metric] + perturbed_metrics
+    stability_penalty = statistics.stdev(metrics) if len(metrics) > 1 else 0
+
+    return stability_penalty
+
+def objective(backtest_func, df, CONSTANT_PARAMS):
+    def wrap(params):
+        all_params = {**params, **CONSTANT_PARAMS}
+        
+        bank = Bank(CONSTANT_PARAMS['initial_capital'])
+        pm = PositionManager(bank)
+
+
+        _, trades = backtest_func(df.copy(), pm, all_params)
+        window_returns = trades['returns']
+        window_dd = trades['drawdown_pct']
+        trade_count = len(trades)
+
+        if trade_count < 50:
+            return {'loss': float('inf'), 'status': STATUS_OK}
+        
+        mean_return = sum(window_returns) / len(window_returns)
+        std_return = statistics.stdev(window_returns) if len(window_returns) > 1 else 0
+        mean_drawdown = sum(window_dd) / len(window_dd)
+        std_drawdown = statistics.stdev(window_dd) if len(window_dd) > 1 else 0
+
+        # Composite loss: Penalize instability (high std) and risk (high drawdown)
+        # Weight as needed; include mean_return if you want some return optimization
+        loss = (std_return * 2) + (std_drawdown * 2) + mean_drawdown - (mean_return * 0.5)
+
+        perturbed_loss = perturb_and_test(backtest_func, df, trades, params, CONSTANT_PARAMS)
+        loss += perturbed_loss
+
+        return {'loss': loss, 'status': STATUS_OK}
+    return wrap
+
+def optimize(backtest_func, df, space, CONSTANT_PARAMS):
+    return fmin(objective(backtest_func, df, CONSTANT_PARAMS), space, algo=tpe.suggest, max_evals=10)
