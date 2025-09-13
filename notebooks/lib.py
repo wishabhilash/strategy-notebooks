@@ -201,8 +201,9 @@ class PositionManager:
         return pd.DataFrame([asdict(p) for p in self.closed_positions]).sort_values(['entry_time']).reset_index(drop=True)
 
 
-def generate_tearsheet(initial_capital, pm: PositionManager):
-    trades = pm.get_trades()
+def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
+    if trades is None:
+        trades = pm.get_trades()
     # Ensure entry_time and exit_time are datetime
     trades['entry_time'] = pd.to_datetime(trades['entry_time'])
     trades['exit_time'] = pd.to_datetime(trades['exit_time'])
