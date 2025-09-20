@@ -3,7 +3,7 @@ from typing import List
 import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import asdict
-from hyperopt import fmin, STATUS_OK, tpe
+from hyperopt import fmin, STATUS_OK, tpe, Trials
 import statistics
 import copy
 
@@ -216,8 +216,10 @@ def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
     win_trades = (trades['pnl'] > 0).sum()
     win_rate = win_trades / total_trades * 100 if total_trades > 0 else 0
 
-    # Total profit
+    # Profit
     total_profit = trades['pnl'].sum()
+    avg_profit = trades[trades.pnl > 0].pnl.mean()
+    avg_loss = trades[trades.pnl <= 0].pnl.mean()
 
     # Total tax
     total_tax = trades['tax'].sum()
@@ -256,6 +258,7 @@ def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
     trades['cum_max'] = trades['cum_pnl'].cummax()
     trades['drawdown'] = trades['cum_pnl'] - trades['cum_max']
     trades['drawdown_pct'] = trades['drawdown'] / trades['cum_max'] * 100
+    avg_dd_perc = trades['drawdown_pct'].mean()
     max_drawdown = trades['drawdown'].min()
     max_drawdown_pct = abs(max_drawdown) / trades['cum_max'].max() * 100 if trades['cum_max'].max() != 0 else 0
 
@@ -277,12 +280,15 @@ def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
         'Avg holding period (days)': avg_holding_period,
         'Win Rate (%)': win_rate,
         'Total Profit': total_profit,
+        'Avg Profit': avg_profit,
+        'Avg Loss': avg_loss,
         'Total Brokerage': total_brokerage,
         'Total Tax': total_tax if total_tax else "N/A",
         'Total MTF': total_mtf_charge if total_mtf_charge else "N/A",
         'CAGR (%)': cagr if cagr else "N/A",
+        'Max Drawdown:': max_drawdown,
         'Max Drawdown (%):': max_drawdown_pct,
-        'Max Drawdown (%):': max_drawdown_pct
+        'Avg Drawdown (%):': avg_dd_perc
     }
     
     return tearsheet, trades
@@ -353,10 +359,15 @@ def objective(backtest_func, df, CONSTANT_PARAMS):
         if trade_count < 50:
             return {'loss': float('inf'), 'status': STATUS_OK}
         
-        mean_return = sum(window_returns) / len(window_returns)
+        mean_return = window_returns.mean()
         std_return = statistics.stdev(window_returns) if len(window_returns) > 1 else 0
         mean_drawdown = sum(window_dd) / len(window_dd)
         std_drawdown = statistics.stdev(window_dd) if len(window_dd) > 1 else 0
+
+        min_in_sample_return = 0.005  # Require at least +0.5% average return in-sample
+        if mean_return < min_in_sample_return:
+            # Penalize unprofitable parameter combinations
+            return {'loss': float('inf'), 'status': STATUS_OK}
 
         # Composite loss: Penalize instability (high std) and risk (high drawdown)
         # Weight as needed; include mean_return if you want some return optimization
@@ -368,5 +379,10 @@ def objective(backtest_func, df, CONSTANT_PARAMS):
         return {'loss': loss, 'status': STATUS_OK}
     return wrap
 
-def optimize(backtest_func, df, space, CONSTANT_PARAMS):
-    return fmin(objective(backtest_func, df, CONSTANT_PARAMS), space, algo=tpe.suggest, max_evals=10)
+def optimize(backtest_func, df, space, CONSTANT_PARAMS, max_evals=100):
+    trials = Trials()
+    result =  fmin(
+        objective(backtest_func, df, CONSTANT_PARAMS), 
+        space, algo=tpe.suggest, max_evals=max_evals, trials=trials
+    )
+    return result, trials
