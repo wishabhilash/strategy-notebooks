@@ -3,10 +3,10 @@ from typing import List
 import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import asdict
-from hyperopt import fmin, STATUS_OK, tpe, Trials
+import optuna
 import statistics
 import copy
-
+from tqdm.notebook import tqdm
 
 
 class Bank:
@@ -34,10 +34,10 @@ class Bank:
     def total_capital(self):
         return self.capital_available + self.capital_deployed
     
-    def settle(self, deployed: float, pnl: float, tax: float):
+    def settle(self, deployed: float, pnl: float):
         deployed = round(deployed, 2)
         self.capital_deployed = round(self.capital_deployed - deployed, 2)
-        self.capital_available = round(self.capital_available + deployed + pnl - tax, 2)
+        self.capital_available = round(self.capital_available + deployed + pnl, 2)
         self.snapshot.append({
             'type': 'settle',
             'capital_deployed': self.capital_deployed,
@@ -79,15 +79,16 @@ class Position:
     brokerage: float = 0.0
 
     def capital_deployed(self):
-        return (self.avg_entry_price * self.quantity)/self.leverage
+        return (self.avg_entry_price * abs(self.quantity))/self.leverage
 
     def close(self, exit_time, exit_price):
         self.exit_time = exit_time
         self.exit_price = exit_price
-        if self.quantity < 0:
-            raise Exception("Quantity can't be negative")
         self.calculate_taxes()
-        self.pnl = (exit_price - self.avg_entry_price) * self.quantity - self.tax
+        if self.quantity > 0:
+            self.pnl = (exit_price - self.avg_entry_price) * self.quantity - self.tax
+        else:
+            self.pnl = (self.avg_entry_price - exit_price) * abs(self.quantity) - self.tax
 
     def calculate_taxes(self):
         extry_taxes = 0
@@ -105,13 +106,13 @@ class Position:
         # --- Add MTF charge ---
         holding_days = (self.exit_time - self.entry_time).days
         holding_days = min(holding_days, self.max_mtf_days)
-        mtf_funded_amount = self.avg_entry_price * self.quantity * (self.leverage - 1) / self.leverage
+        mtf_funded_amount = self.avg_entry_price * abs(self.quantity) * (self.leverage - 1) / self.leverage
         self.mtf_charge = round(mtf_funded_amount * self.mtf_rate_daily * holding_days, 2)
 
         # Brokerage
         if self.entry_time.date() == self.exit_time.date():
-            buy_side_brokerage = min((self.quantity * self.avg_entry_price) * 0.03, 20)
-            sell_side_brokerage = min((self.quantity * self.exit_price) * 0.03, 20)
+            buy_side_brokerage = min((abs(self.quantity) * self.avg_entry_price) * 0.03, self.brokerage)
+            sell_side_brokerage = min((abs(self.quantity) * self.exit_price) * 0.03, self.brokerage)
             self.brokerage = round(buy_side_brokerage + sell_side_brokerage, 2)
 
         self.tax = round(extry_taxes + exit_taxes + self.mtf_charge + self.brokerage, 2)
@@ -139,29 +140,34 @@ class PositionManager:
     closed_positions: list = field(default_factory=list)
     leverage: int = 1
     mtf_rate_daily: float = 0.0192 / 100
+    brokerage: float = 20.0
 
-    def new_position(self, stock, entry_time, entry_price, capital: float) -> Position | None:
+    def new_position(self, stock, entry_time, entry_price, capital: float, direction=1) -> Position | None:
         qty = 0
 
         capital = self.bank.borrow(capital)
         if capital <= 0:
+            # print(f"No capital available to open new position at {entry_time}")
             return
 
         try:
             qty = round(capital * self.leverage / entry_price)
         except Exception as e:
+            # print(f"Error calculating qty for {stock} at price {entry_price} and {entry_time}: {e}")
             return None
         
         if qty <= 0:
+            # print(f"Calculated qty is zero for {stock} at price {entry_price} and {entry_time}")
             return None
 
         position = Position(
             stock,
             entry_time,
             mtf_rate_daily=self.mtf_rate_daily,
-            leverage=self.leverage
+            leverage=self.leverage,
+            brokerage=self.brokerage
         )
-        trade = Trade(entry_time, entry_price, qty)
+        trade = Trade(entry_time, entry_price, qty * direction)
         position.add_trade(trade)
         self.active_positions[position.stock] = position
         return position
@@ -172,7 +178,7 @@ class PositionManager:
             position.close(exit_time, exit_price)
             self.closed_positions.append(position)
             self.active_positions[position.stock] = None
-            self.bank.settle(position.capital_deployed(), position.pnl, position.tax)
+            self.bank.settle(position.capital_deployed(), position.pnl)
         return position
     
     def add_trade_to_position(self, stock, entry_time, entry_price):
@@ -198,7 +204,10 @@ class PositionManager:
         return len(self.get_active_positions()) > 0
     
     def get_trades(self):
-        return pd.DataFrame([asdict(p) for p in self.closed_positions]).sort_values(['entry_time']).reset_index(drop=True)
+        df = pd.DataFrame([asdict(p) for p in self.closed_positions])
+        if df.empty:
+            return df
+        return df.sort_values(['entry_time']).reset_index(drop=True)
 
 
 def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
@@ -286,9 +295,9 @@ def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
         'Total Tax': total_tax if total_tax else "N/A",
         'Total MTF': total_mtf_charge if total_mtf_charge else "N/A",
         'CAGR (%)': cagr if cagr else "N/A",
-        'Max Drawdown:': max_drawdown,
-        'Max Drawdown (%):': max_drawdown_pct,
-        'Avg Drawdown (%):': avg_dd_perc
+        'Max Drawdown': max_drawdown,
+        'Max Drawdown (%)': max_drawdown_pct,
+        'Avg Drawdown (%)': avg_dd_perc
     }
     
     return tearsheet, trades
@@ -343,46 +352,46 @@ def perturb_and_test(backtest_func, df, base_result, params, CONSTANT_PARAMS, pe
 
     return stability_penalty
 
-def objective(backtest_func, df, CONSTANT_PARAMS):
-    def wrap(params):
-        all_params = {**params, **CONSTANT_PARAMS}
-        
-        bank = Bank(CONSTANT_PARAMS['initial_capital'])
-        pm = PositionManager(bank)
+def objective(trial, backtest_func, df, CONSTANT_PARAMS, space):
+    # Build param dict using Optuna's suggest API
+    params = {}
+    for k, v in space.items():
+        if v['type'] == 'float':
+            params[k] = trial.suggest_float(k, v['low'], v['high'], v['step'], log=v.get('log', False))
+        elif v['type'] == 'int':
+            params[k] = trial.suggest_int(k, v['low'], v['high'], v['step'], log=v.get('log', False))
+        elif v['type'] == 'categorical':
+            params[k] = trial.suggest_categorical(k, v['choices'])
 
+    all_params = {**params, **CONSTANT_PARAMS}
+    
+    bank = Bank(CONSTANT_PARAMS['initial_capital'])
+    pm = PositionManager(bank)
+    tearsheet, trades = backtest_func(df.copy(), pm, all_params)
+    avg_dd = abs(tearsheet['Avg Drawdown (%)'])
+    cagr = tearsheet['CAGR (%)']
+    window_returns = trades['returns']
+    trade_count = len(trades)
+    
+    if trade_count < 50:
+        return float('inf')
+    
+    mean_return = window_returns.mean()
+    min_in_sample_return = 0.005
+    if mean_return < min_in_sample_return:
+        return float('inf')
+    
+    loss = cagr / avg_dd
+    perturbed_loss = perturb_and_test(backtest_func, df, trades, params, CONSTANT_PARAMS)
+    loss += perturbed_loss
+    return loss
 
-        _, trades = backtest_func(df.copy(), pm, all_params)
-        window_returns = trades['returns']
-        window_dd = trades['drawdown_pct']
-        trade_count = len(trades)
-
-        if trade_count < 50:
-            return {'loss': float('inf'), 'status': STATUS_OK}
-        
-        mean_return = window_returns.mean()
-        std_return = statistics.stdev(window_returns) if len(window_returns) > 1 else 0
-        mean_drawdown = sum(window_dd) / len(window_dd)
-        std_drawdown = statistics.stdev(window_dd) if len(window_dd) > 1 else 0
-
-        min_in_sample_return = 0.005  # Require at least +0.5% average return in-sample
-        if mean_return < min_in_sample_return:
-            # Penalize unprofitable parameter combinations
-            return {'loss': float('inf'), 'status': STATUS_OK}
-
-        # Composite loss: Penalize instability (high std) and risk (high drawdown)
-        # Weight as needed; include mean_return if you want some return optimization
-        loss = (std_return * 2) + (std_drawdown * 2) + mean_drawdown - (mean_return * 0.5)
-
-        perturbed_loss = perturb_and_test(backtest_func, df, trades, params, CONSTANT_PARAMS)
-        loss += perturbed_loss
-
-        return {'loss': loss, 'status': STATUS_OK}
-    return wrap
-
-def optimize(backtest_func, df, space, CONSTANT_PARAMS, max_evals=100):
-    trials = Trials()
-    result =  fmin(
-        objective(backtest_func, df, CONSTANT_PARAMS), 
-        space, algo=tpe.suggest, max_evals=max_evals, trials=trials
-    )
-    return result, trials
+def optimize(backtest_func, df, space, CONSTANT_PARAMS, max_evals=100, n_jobs=1):
+    pb = tqdm(total=max_evals, desc="Optimizing")
+    def optuna_obj(trial):
+        result = objective(trial, backtest_func, df.copy(), CONSTANT_PARAMS, space)
+        pb.update(1)
+    study = optuna.create_study(direction='minimize')
+    study.optimize(optuna_obj, n_trials=max_evals, n_jobs=n_jobs)
+    pb.close()
+    return study
