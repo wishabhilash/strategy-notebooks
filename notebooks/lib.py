@@ -3,10 +3,12 @@ from typing import List
 import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import asdict
-from hyperopt import fmin, STATUS_OK, tpe, Trials
 import statistics
 import copy
-
+from tqdm.notebook import tqdm
+import multiprocessing as mp
+import optuna
+import uuid
 
 
 class Bank:
@@ -37,7 +39,7 @@ class Bank:
     def settle(self, deployed: float, pnl: float, tax: float):
         deployed = round(deployed, 2)
         self.capital_deployed = round(self.capital_deployed - deployed, 2)
-        self.capital_available = round(self.capital_available + deployed + pnl - tax, 2)
+        self.capital_available = round(self.capital_available + deployed + pnl, 2)
         self.snapshot.append({
             'type': 'settle',
             'capital_deployed': self.capital_deployed,
@@ -110,8 +112,8 @@ class Position:
 
         # Brokerage
         if self.entry_time.date() == self.exit_time.date():
-            buy_side_brokerage = min((self.quantity * self.avg_entry_price) * 0.03, 20)
-            sell_side_brokerage = min((self.quantity * self.exit_price) * 0.03, 20)
+            buy_side_brokerage = min((self.quantity * self.avg_entry_price) * 0.03, self.brokerage)
+            sell_side_brokerage = min((self.quantity * self.exit_price) * 0.03, self.brokerage)
             self.brokerage = round(buy_side_brokerage + sell_side_brokerage, 2)
 
         self.tax = round(extry_taxes + exit_taxes + self.mtf_charge + self.brokerage, 2)
@@ -139,6 +141,7 @@ class PositionManager:
     closed_positions: list = field(default_factory=list)
     leverage: int = 1
     mtf_rate_daily: float = 0.0192 / 100
+    brokerage: float = 0.0
 
     def new_position(self, stock, entry_time, entry_price, capital: float) -> Position | None:
         qty = 0
@@ -159,7 +162,8 @@ class PositionManager:
             stock,
             entry_time,
             mtf_rate_daily=self.mtf_rate_daily,
-            leverage=self.leverage
+            leverage=self.leverage,
+            brokerage=self.brokerage
         )
         trade = Trade(entry_time, entry_price, qty)
         position.add_trade(trade)
@@ -286,9 +290,9 @@ def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
         'Total Tax': total_tax if total_tax else "N/A",
         'Total MTF': total_mtf_charge if total_mtf_charge else "N/A",
         'CAGR (%)': cagr if cagr else "N/A",
-        'Max Drawdown:': max_drawdown,
-        'Max Drawdown (%):': max_drawdown_pct,
-        'Avg Drawdown (%):': avg_dd_perc
+        'Max Drawdown': max_drawdown,
+        'Max Drawdown (%)': max_drawdown_pct,
+        'Avg Drawdown (%)': avg_dd_perc
     }
     
     return tearsheet, trades
@@ -311,78 +315,131 @@ def show_equity_curve(trades: pd.DataFrame):
     plt.xticks(rotation=45)
     plt.show()
 
-
-def perturb_and_test(backtest_func, df, base_result, params, CONSTANT_PARAMS, perturb_pct=0.10):
-    base_metric = sum(base_result['returns']) / len(base_result['returns'])
-
-    bank = Bank(CONSTANT_PARAMS['initial_capital'])
-    pm = PositionManager(bank)
-    perturbed_metrics = []
-
+def get_perturb_params(params, CONSTANT_PARAMS, perturb_pct=0.10):
+    if perturb_pct <= 0:
+        return []
+    
+    perturb_params = []
     for key, value in params.items():
         if isinstance(value, (int, float)):
             # Perturb down
-            down_params = copy.deepcopy(params)
-            down_params[key] = value * (1 - perturb_pct)
-            all_params = {**down_params, **CONSTANT_PARAMS}
-            _, down_results = backtest_func(df.copy(), pm, all_params)
-            metric_down = sum(down_results['returns']) / len(down_results['returns'])
-            perturbed_metrics.append(metric_down)
-
+            params_copy = copy.deepcopy(params)
+            params_copy[key] = value * (1 - perturb_pct)
+            down_params = {**params_copy, **CONSTANT_PARAMS}
+            perturb_params.append(down_params)
+            
             # Perturb up
-            up_params = copy.deepcopy(params)
-            up_params[key] = value * (1 + perturb_pct)
-            all_params = {**up_params, **CONSTANT_PARAMS}
-            _, up_results = backtest_func(df.copy(), pm, all_params)
-            metric_up = sum(up_results['returns']) / len(up_results['returns'])
-            perturbed_metrics.append(metric_up)
+            params_copy = copy.deepcopy(params)
+            params_copy[key] = value * (1 + perturb_pct)
+            up_params = {**params_copy, **CONSTANT_PARAMS}
+            perturb_params.append(up_params)
+    return perturb_params
 
-    # Calculate penalty as std deviation of base + perturbed metrics
+def backtest_worker(idx, q, backtest_func, df, params):
+    bank = Bank(params['initial_capital'])
+    pm = PositionManager(bank, brokerage=params['brokerage'])
+    tearsheet, trades = backtest_func(df.copy(), pm, params, show_pb=params['show_pb'])
+
+    filename = f'results/{uuid.uuid4().hex}_{idx}.csv'
+    trades.to_csv(filename, index=False)
+    q.put((idx, tearsheet, filename))
+    with open(f'backtest_log_{idx}.txt', 'w') as f:
+        f.write(str(params) + '\n')
+        f.write('done')
+
+def calc_perturb_loss2(base_metric, perturbed_results):
+    perturbed_metrics = []
+    for result in perturbed_results:
+        metric = calc_performance(*result)
+        perturbed_metrics.append(metric)
     metrics = [base_metric] + perturbed_metrics
     stability_penalty = statistics.stdev(metrics) if len(metrics) > 1 else 0
-
     return stability_penalty
 
-def objective(backtest_func, df, CONSTANT_PARAMS):
-    def wrap(params):
-        all_params = {**params, **CONSTANT_PARAMS}
-        
-        bank = Bank(CONSTANT_PARAMS['initial_capital'])
-        pm = PositionManager(bank)
+def calc_perturb_loss(base_trades_file, perturbed_results):
+    base_trades = pd.read_csv(base_trades_file)
+    base_metric = base_trades['returns'].mean() if len(base_trades) > 0 else 0
+    perturbed_metrics = []
+    for result in perturbed_results:
+        trades = pd.read_csv(result[2])
+        metric = trades['returns'].mean() if len(trades) > 0 else 0
+        perturbed_metrics.append(metric)
+    metrics = [base_metric] + perturbed_metrics
+    stability_penalty = statistics.stdev(metrics) if len(metrics) > 1 else 0
+    return stability_penalty
 
+def clean_results():
+    import os
+    import glob
+    files = glob.glob('results/*.csv') + glob.glob('backtest_log_*.txt')
+    for f in files:
+        os.remove(f)
 
-        _, trades = backtest_func(df.copy(), pm, all_params)
-        window_returns = trades['returns']
-        window_dd = trades['drawdown_pct']
-        trade_count = len(trades)
+def get_cagr(tearsheet):
+    return tearsheet['CAGR (%)'] if tearsheet['CAGR (%)'] != "N/A" else 0
 
-        if trade_count < 50:
-            return {'loss': float('inf'), 'status': STATUS_OK}
-        
-        mean_return = window_returns.mean()
-        std_return = statistics.stdev(window_returns) if len(window_returns) > 1 else 0
-        mean_drawdown = sum(window_dd) / len(window_dd)
-        std_drawdown = statistics.stdev(window_dd) if len(window_dd) > 1 else 0
+def get_avg_dd(tearsheet):
+    return tearsheet['Avg Drawdown (%)'] if tearsheet['Avg Drawdown (%)'] != "N/A" else 0
 
-        min_in_sample_return = 0.005  # Require at least +0.5% average return in-sample
-        if mean_return < min_in_sample_return:
-            # Penalize unprofitable parameter combinations
-            return {'loss': float('inf'), 'status': STATUS_OK}
+def calc_performance(idx, tearsheet, trades_file):
+    trades = pd.read_csv(trades_file)
+    cagr = get_cagr(tearsheet)
+    avg_dd = get_avg_dd(tearsheet)
+    trade_count = len(trades)
+    if trade_count < 50:
+        return float('inf')
+    
+    perf = (cagr / abs(avg_dd)) if avg_dd != 0 else float('inf')
+    return perf
 
-        # Composite loss: Penalize instability (high std) and risk (high drawdown)
-        # Weight as needed; include mean_return if you want some return optimization
-        loss = (std_return * 2) + (std_drawdown * 2) + mean_drawdown - (mean_return * 0.5)
+def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct):
+    # Build param dict using Optuna's suggest API
+    params = {}
+    for k, v in space.items():
+        if v['type'] == 'float':
+            params[k] = trial.suggest_float(k, v['low'], v['high'], step=v['step'])
+        elif v['type'] == 'int':
+            params[k] = trial.suggest_int(k, v['low'], v['high'], v['step'], log=v.get('log', False))
+        elif v['type'] == 'categorical':
+            params[k] = trial.suggest_categorical(k, v['choices'])
 
-        perturbed_loss = perturb_and_test(backtest_func, df, trades, params, CONSTANT_PARAMS)
-        loss += perturbed_loss
+    combined_params = {**params, **CONSTANT_PARAMS}
+    perturb_params = get_perturb_params(params, CONSTANT_PARAMS, perturb_pct)
 
-        return {'loss': loss, 'status': STATUS_OK}
-    return wrap
+    processes = []
+    q = mp.Queue()
+    all_params = [combined_params] + perturb_params
 
-def optimize(backtest_func, df, space, CONSTANT_PARAMS, max_evals=100):
-    trials = Trials()
-    result =  fmin(
-        objective(backtest_func, df, CONSTANT_PARAMS), 
-        space, algo=tpe.suggest, max_evals=max_evals, trials=trials
-    )
-    return result, trials
+    for i, param_set in enumerate(all_params):
+        p = mp.Process(target=backtest_worker, args=(i, q, backtest_func, df, param_set))
+        processes.append(p)
+        p.start()
+    for p in processes:
+        p.join()
+
+    results = [q.get() for _ in processes]
+    results.sort(key=lambda x: x[0])  # Sort by index to maintain order
+    
+    main_result = results[0]
+    
+    loss = -calc_performance(*main_result)
+
+    perturbed_loss = calc_perturb_loss(main_result[-1], results[1:])
+    loss += perturbed_loss
+    
+    clean_results()
+    cagr = get_cagr(main_result[1])
+    avg_dd = get_avg_dd(main_result[1])
+    print(f"cagr: {cagr}, avg_dd: {avg_dd}, loss: {loss}, perturbed_loss: {perturbed_loss}")
+    return loss
+
+def optimize(backtest_func, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_evals=100, n_jobs=1):
+    pb = tqdm(total=max_evals, desc="Optimizing")
+    def optuna_obj(trial):
+        result = objective(trial, backtest_func, df.copy(), CONSTANT_PARAMS, space, perturb_pct)
+        pb.update(1)
+        return result
+    study = optuna.create_study(direction='minimize')
+    study.optimize(optuna_obj, n_trials=max_evals, n_jobs=n_jobs)
+    pb.close()
+    return study
