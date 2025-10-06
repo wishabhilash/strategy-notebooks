@@ -7,4 +7,5 @@ notebooks/cifar_net.pth
 data
 data5m
 data15m
+data60m
 __pycache__
