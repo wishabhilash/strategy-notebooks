@@ -5,7 +5,7 @@ from lib import Bank, PositionManager, generate_tearsheet
 import talib as ta
 from tqdm.notebook import tqdm
 import numpy as np
-from lib import optimize
+from lib import optimize, grid_search
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -14,7 +14,7 @@ warnings.filterwarnings('ignore')
 def backtest(_df, pm: PositionManager, params, show_pb=False):
     max_positions = params['max_positions']
     bb_period = int(params['bb_period'])
-    bb_sd = params['bb_sd']
+    bb_sd = round(params['bb_sd'], 1)
     start_date = params['start_date']
     end_date = params['end_date']
     initial_capital = params['initial_capital']
@@ -131,10 +131,12 @@ if __name__ == "__main__":
     }
 
     space = {
-        "bb_period": {"type": "int", "low": 50, "high": 150, 'step': 10},
-        "bb_sd": {"type": "float", "low": 1.2, "high": 2.2, 'step': 0.2},
+        "bb_period": {"type": "int", "low": 10, "high": 150, 'step': 10},
+        "bb_sd": {"type": "float", "low": 1.2, "high": 2.6, 'step': 0.2},
     }
 
-    study = optimize(backtest, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_evals=20, n_jobs=1)
-    print("Best parameters:", study.best_params)
-    print("Best objective:", study.best_value)
+    # study = optimize(backtest, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_evals=20, n_jobs=1)
+    # print("Best parameters:", study.best_params)
+    # print("Best objective:", study.best_value)
+
+    grid_search(backtest, df, space, CONSTANT_PARAMS)

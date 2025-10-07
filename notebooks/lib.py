@@ -8,7 +8,8 @@ import copy
 from tqdm.notebook import tqdm
 import multiprocessing as mp
 import optuna
-import uuid
+import numpy as np
+import copy
 
 
 class Bank:
@@ -335,17 +336,12 @@ def get_perturb_params(params, CONSTANT_PARAMS, perturb_pct=0.10):
             perturb_params.append(up_params)
     return perturb_params
 
-def backtest_worker(idx, q, backtest_func, df, params):
+def backtest_worker(args):
+    idx, backtest_func, df, params = args
     bank = Bank(params['initial_capital'])
     pm = PositionManager(bank, brokerage=params['brokerage'])
     tearsheet, trades = backtest_func(df.copy(), pm, params, show_pb=params['show_pb'])
-
-    filename = f'results/{uuid.uuid4().hex}_{idx}.csv'
-    trades.to_csv(filename, index=False)
-    q.put((idx, tearsheet, filename))
-    with open(f'backtest_log_{idx}.txt', 'w') as f:
-        f.write(str(params) + '\n')
-        f.write('done')
+    return (idx, tearsheet, trades)
 
 def calc_perturb_loss2(base_metric, perturbed_results):
     perturbed_metrics = []
@@ -356,24 +352,16 @@ def calc_perturb_loss2(base_metric, perturbed_results):
     stability_penalty = statistics.stdev(metrics) if len(metrics) > 1 else 0
     return stability_penalty
 
-def calc_perturb_loss(base_trades_file, perturbed_results):
-    base_trades = pd.read_csv(base_trades_file)
+def calc_perturb_loss(base_trades, perturbed_results):
     base_metric = base_trades['returns'].mean() if len(base_trades) > 0 else 0
     perturbed_metrics = []
     for result in perturbed_results:
-        trades = pd.read_csv(result[2])
+        trades = result[-1]
         metric = trades['returns'].mean() if len(trades) > 0 else 0
         perturbed_metrics.append(metric)
     metrics = [base_metric] + perturbed_metrics
     stability_penalty = statistics.stdev(metrics) if len(metrics) > 1 else 0
     return stability_penalty
-
-def clean_results():
-    import os
-    import glob
-    files = glob.glob('results/*.csv') + glob.glob('backtest_log_*.txt')
-    for f in files:
-        os.remove(f)
 
 def get_cagr(tearsheet):
     return tearsheet['CAGR (%)'] if tearsheet['CAGR (%)'] != "N/A" else 0
@@ -381,15 +369,14 @@ def get_cagr(tearsheet):
 def get_avg_dd(tearsheet):
     return tearsheet['Avg Drawdown (%)'] if tearsheet['Avg Drawdown (%)'] != "N/A" else 0
 
-def calc_performance(idx, tearsheet, trades_file):
-    trades = pd.read_csv(trades_file)
+def calc_performance(tearsheet, trades):
     cagr = get_cagr(tearsheet)
     avg_dd = get_avg_dd(tearsheet)
     trade_count = len(trades)
     if trade_count < 50:
-        return float('inf')
+        return -float('inf')
     
-    perf = (cagr / abs(avg_dd)) if avg_dd != 0 else float('inf')
+    perf = (cagr / abs(avg_dd)) if avg_dd != 0 else -float('inf')
     return perf
 
 def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct):
@@ -406,30 +393,23 @@ def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct):
     combined_params = {**params, **CONSTANT_PARAMS}
     perturb_params = get_perturb_params(params, CONSTANT_PARAMS, perturb_pct)
 
-    processes = []
-    q = mp.Queue()
     all_params = [combined_params] + perturb_params
 
-    for i, param_set in enumerate(all_params):
-        p = mp.Process(target=backtest_worker, args=(i, q, backtest_func, df, param_set))
-        processes.append(p)
-        p.start()
-    for p in processes:
-        p.join()
-
-    results = [q.get() for _ in processes]
-    results.sort(key=lambda x: x[0])  # Sort by index to maintain order
+    results = []
+    with mp.Pool(processes=min(len(all_params), mp.cpu_count())) as pool:
+        args = [(i, backtest_func, df, param_set) for i, param_set in enumerate(all_params)]
+        for result in pool.map(backtest_worker, args):
+            results.append(result)
+        
+    _, main_tearsheet, main_trades = results[0]
     
-    main_result = results[0]
-    
-    loss = -calc_performance(*main_result)
+    loss = -calc_performance(main_tearsheet, main_trades)
 
-    perturbed_loss = calc_perturb_loss(main_result[-1], results[1:])
+    perturbed_loss = calc_perturb_loss(main_trades, results[1:])
     loss += perturbed_loss
     
-    clean_results()
-    cagr = get_cagr(main_result[1])
-    avg_dd = get_avg_dd(main_result[1])
+    cagr = get_cagr(main_tearsheet)
+    avg_dd = get_avg_dd(main_tearsheet)
     print(f"cagr: {cagr}, avg_dd: {avg_dd}, loss: {loss}, perturbed_loss: {perturbed_loss}")
     return loss
 
@@ -443,3 +423,51 @@ def optimize(backtest_func, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_eva
     study.optimize(optuna_obj, n_trials=max_evals, n_jobs=n_jobs)
     pb.close()
     return study
+
+def grid_search(backtest_func, df, space, CONSTANT_PARAMS):
+    from itertools import product
+
+    space_ranges = {}
+    for key in space.keys():
+        space_ranges[key] = np.arange(space[key]['low'], space[key]['high'], space[key]['step'])
+
+    param_combinations = [dict(zip(space_ranges.keys(), v)) for v in product(*space_ranges.values())]
+
+    results = {}
+    with mp.Pool(processes=min(len(param_combinations), mp.cpu_count())) as pool:
+        args = [(idx, backtest_func, df, {**param_set, **CONSTANT_PARAMS}) for idx, param_set in enumerate(param_combinations)]
+        for result in tqdm(pool.imap_unordered(backtest_worker, args), desc="Grid Search", total=len(args)):
+            results[result[0]] = result
+
+
+    rows = []
+    for idx, param in enumerate(param_combinations):
+        _, tearsheet, trades = results[idx]
+        perf = calc_performance(tearsheet, trades)
+        keys = sorted(param.keys())
+        row = {keys[0]: param[keys[0]], keys[1]: param[keys[1]], "performance": perf}
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    # Get sorted unique parameter values
+    x_unique = np.sort(df[keys[0]].unique())
+    y_unique = np.sort(df[keys[1]].unique())
+
+    # Pivot to create 2D grid of performance
+    Z = df.pivot(index=keys[0], columns=keys[1], values='performance').values
+
+    # Create meshgrid for X and Y
+    X, Y = np.meshgrid(x_unique, y_unique, indexing='ij')
+
+    fig = plt.figure(figsize=(10,8))
+    ax = fig.add_subplot(111, projection='3d')
+    surf = ax.plot_surface(X, Y, Z, cmap='viridis', edgecolor='none')
+
+    ax.set_xlabel(keys[0])
+    ax.set_ylabel(keys[1])
+    ax.set_zlabel("Performance")
+    ax.set_title("3D Surface Plot")
+
+    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=7)
+    plt.show()
