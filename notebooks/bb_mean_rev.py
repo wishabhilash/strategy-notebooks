@@ -1,11 +1,12 @@
+from copy import copy
+import os
 import pandas as pd
 from fyers_helper import prepare_data, load_stock_data
 import datetime as dt
-from lib import Bank, PositionManager, generate_tearsheet
+from lib import PositionManager, generate_tearsheet, optimize, grid_search, generate_wfo_splits, backtest_worker, show_equity_curve
 import talib as ta
 from tqdm.notebook import tqdm
 import numpy as np
-from lib import optimize, grid_search
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -30,10 +31,6 @@ def backtest(_df, pm: PositionManager, params, show_pb=False):
             nbdevdn=bb_sd,         # number of stdevs for lower band
             matype=0           # MA_Type.SMA (0), EMA (1), etc.
         )
-        # group['middle_band'] = group['Close'].rolling(window=bb_period).mean()
-        # stddev = group['Close'].rolling(window=bb_period).std(ddof=0)
-        # group['upper_band'] = group['middle_band'] + (stddev * bb_sd)
-        # group['lower_band'] = group['middle_band'] - (stddev * bb_sd)
         return group
     
     def calc_aroon(group):
@@ -78,7 +75,7 @@ def backtest(_df, pm: PositionManager, params, show_pb=False):
             if len(stock) < 1:
                 continue
             try:
-                if (stock.Close.iloc[0] >= stock.middle_band.iloc[0]):
+                if (stock.Close.iloc[0] >= stock.middle_band.iloc[0]):# or (stock.Close.iloc[0] - position.avg_entry_price)/position.avg_entry_price * 100 <= -5:
                     pm.close_position(position.stock, idx, stock.exit_price.iloc[0])
 
             except Exception as e:
@@ -104,21 +101,73 @@ def backtest(_df, pm: PositionManager, params, show_pb=False):
     return generate_tearsheet(initial_capital, pm)
 
 
+def wf_opt(params, space, num_of_splits, insample_ratio_size, outsample_ratio_size):
+    all_trades = []
+    all_tearsheets = []
+    splits = generate_wfo_splits(
+        start_date=params['start_date'], 
+        end_date=params['end_date'], 
+        num_of_splits=num_of_splits, 
+        insample_ratio_size=insample_ratio_size, 
+        outsample_ratio_size=outsample_ratio_size
+    )
+    for split in splits:
+        filename = f"/Users/abhilashnanda/code/strategy-notebooks/notebooks/trades/bb_mean_rev_trades_{split['oos_start']}_{split['oos_end']}.csv"
+        if os.path.exists(filename):
+            all_trades.append(pd.read_csv(filename))
+            print(f"File {filename} exists, skipping...")
+            continue
+        print(split)
+        params = copy(params)
+        params['start_date'] = split['is_start']
+        params['end_date'] = split['is_end']
+        for i in range(1, 4):
+            study = optimize(backtest, df, space, params, perturb_pct=0.1, max_evals=i*30, n_jobs=2)
+            if not np.isinf(study.best_value):
+                break
+            print("Retrying optimization with more evaluations...")
+
+        if study.best_value > 0:
+            print(f"All perturbations resulted in performance of loss, skipping this split - {split}.")
+            continue
+        params = copy(params)
+        params['start_date'] = split['oos_start']
+        params['end_date'] = split['oos_end']
+        params.update(study.best_params)
+        if len(all_tearsheets) > 0:
+            params['initial_capital'] = all_tearsheets[-1]['Final capital']
+
+        _, tearsheet, trades = backtest_worker((0, backtest, df, params))
+        trades.to_csv(filename, index=False)
+        all_trades.append(trades)
+        all_tearsheets.append(tearsheet)
+
+
+    all_trades_df = pd.concat(all_trades).reset_index(drop=True)
+    final_tearsheet, final_trades = generate_tearsheet(CONSTANT_PARAMS['initial_capital'], None, trades=all_trades_df)
+
+    print(pd.DataFrame({
+        "Metrics": final_tearsheet.keys(),
+        "Values": final_tearsheet.values(),
+    }))
+    show_equity_curve(final_trades)
+
+
 if __name__ == "__main__":
     interval = "5"
 
-    nifty200_df = pd.read_csv('nifty200.csv')
-    tickers = [ f'NSE:{n}-EQ' for n in nifty200_df.Symbol.tolist()]
+    nifty_df = pd.read_csv('/Users/abhilashnanda/code/strategy-notebooks/notebooks/nifty200.csv')
+    tickers = [ f'NSE:{n}-EQ' for n in nifty_df.Symbol.tolist()]
 
-    data_path = "../data5m"
+    data_path = "/Users/abhilashnanda/code/strategy-notebooks/data5m"
 
     end_date = dt.datetime.now()
     start_date = dt.datetime(2015, 1, 1)
 
     file_paths = prepare_data(tickers, interval, start_date=start_date, end_date=end_date, path=data_path, overwrite=False)
-    loaded_data_1D = load_stock_data(file_paths, data_path, interval)
+    loaded_data = load_stock_data(file_paths, data_path, interval)
 
-    df = pd.concat(loaded_data_1D, names=["Stock", "Date"]).reset_index()
+    df = pd.concat(loaded_data, names=["Stock", "Date"]).reset_index()
 
 
     CONSTANT_PARAMS = {
@@ -126,17 +175,17 @@ if __name__ == "__main__":
         'max_positions': 5,
         'brokerage': 0,
         'show_pb': False,
-        'start_date': '2022-01-01',
-        'end_date': '2022-06-01',
+        'start_date': '2024-10-01',
+        'end_date': '2025-06-01',
+        # 'start_date': '2022-12-01',
+        # 'end_date': '2023-03-03',
     }
 
     space = {
         "bb_period": {"type": "int", "low": 10, "high": 150, 'step': 10},
-        "bb_sd": {"type": "float", "low": 1.2, "high": 2.6, 'step': 0.2},
+        "bb_sd": {"type": "float", "low": 1, "high": 4, 'step': 0.4},
     }
 
-    # study = optimize(backtest, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_evals=20, n_jobs=1)
-    # print("Best parameters:", study.best_params)
-    # print("Best objective:", study.best_value)
-
-    grid_search(backtest, df, space, CONSTANT_PARAMS)
+    wf_opt(CONSTANT_PARAMS, space, num_of_splits=57, insample_ratio_size=0.75, outsample_ratio_size=0.25)
+    
+    # grid_search(backtest, df, space, CONSTANT_PARAMS, n_jobs=8)

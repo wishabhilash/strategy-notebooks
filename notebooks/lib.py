@@ -1,9 +1,7 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import List
 import pandas as pd
 import matplotlib.pyplot as plt
-from dataclasses import asdict
-import statistics
 import copy
 from tqdm.notebook import tqdm
 import multiprocessing as mp
@@ -203,12 +201,18 @@ class PositionManager:
         return len(self.get_active_positions()) > 0
     
     def get_trades(self):
+        if len(self.closed_positions) == 0:
+            return pd.DataFrame()
         return pd.DataFrame([asdict(p) for p in self.closed_positions]).sort_values(['entry_time']).reset_index(drop=True)
 
 
 def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
     if trades is None:
         trades = pm.get_trades()
+
+    if len(trades) == 0:
+        return {}, trades
+    
     # Ensure entry_time and exit_time are datetime
     trades['entry_time'] = pd.to_datetime(trades['entry_time'])
     trades['exit_time'] = pd.to_datetime(trades['exit_time'])
@@ -244,7 +248,9 @@ def generate_tearsheet(initial_capital, pm: PositionManager, trades=None):
     cagr = ((final / initial) ** (1 / years) - 1) * 100 if years > 0 else None
 
     # Active positions
-    active_position_count = sum([len(p.trades) for p in pm.get_active_positions() if p is not None])
+    active_position_count = 0
+    if pm is not None:
+        active_position_count = sum([len(p.trades) for p in pm.get_active_positions() if p is not None])
 
     # Period
     period = f"{start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}"
@@ -326,13 +332,13 @@ def get_perturb_params(params, CONSTANT_PARAMS, perturb_pct=0.10):
             # Perturb down
             params_copy = copy.deepcopy(params)
             params_copy[key] = value * (1 - perturb_pct)
-            down_params = {**params_copy, **CONSTANT_PARAMS}
+            down_params = {**CONSTANT_PARAMS, **params_copy}
             perturb_params.append(down_params)
             
             # Perturb up
             params_copy = copy.deepcopy(params)
             params_copy[key] = value * (1 + perturb_pct)
-            up_params = {**params_copy, **CONSTANT_PARAMS}
+            up_params = {**CONSTANT_PARAMS, **params_copy}
             perturb_params.append(up_params)
     return perturb_params
 
@@ -343,16 +349,22 @@ def backtest_worker(args):
     tearsheet, trades = backtest_func(df.copy(), pm, params, show_pb=params['show_pb'])
     return (idx, tearsheet, trades)
 
-def calc_perturb_loss2(base_metric, perturbed_results):
+def calc_perturb_loss2(base_tearsheet, base_trades, perturbed_results):
+    base_metric = calc_performance(base_tearsheet, base_trades)
     perturbed_metrics = []
     for result in perturbed_results:
-        metric = calc_performance(*result)
+        _, tearsheet, trades = result
+        metric = calc_performance(tearsheet, trades)
         perturbed_metrics.append(metric)
     metrics = [base_metric] + perturbed_metrics
-    stability_penalty = statistics.stdev(metrics) if len(metrics) > 1 else 0
+
+    stability_penalty = np.std(metrics, ddof=1) if len(metrics) > 1 else 0
+
+    if np.isnan(stability_penalty):
+        return -float('inf')
     return stability_penalty
 
-def calc_perturb_loss(base_trades, perturbed_results):
+def calc_perturb_loss(base_tearsheet, base_trades, perturbed_results):
     base_metric = base_trades['returns'].mean() if len(base_trades) > 0 else 0
     perturbed_metrics = []
     for result in perturbed_results:
@@ -360,21 +372,29 @@ def calc_perturb_loss(base_trades, perturbed_results):
         metric = trades['returns'].mean() if len(trades) > 0 else 0
         perturbed_metrics.append(metric)
     metrics = [base_metric] + perturbed_metrics
-    stability_penalty = statistics.stdev(metrics) if len(metrics) > 1 else 0
+    try:
+        stability_penalty = np.std(metrics, ddof=1) if len(metrics) > 1 else 0
+    except Exception as e:
+        return -float('inf')
     return stability_penalty
 
 def get_cagr(tearsheet):
-    return tearsheet['CAGR (%)'] if tearsheet['CAGR (%)'] != "N/A" else 0
+    return tearsheet['CAGR (%)'] if tearsheet.get('CAGR (%)', "N/A") != "N/A" else 0
 
 def get_avg_dd(tearsheet):
-    return tearsheet['Avg Drawdown (%)'] if tearsheet['Avg Drawdown (%)'] != "N/A" else 0
+    return tearsheet['Avg Drawdown (%)'] if tearsheet.get('Avg Drawdown (%)', "N/A") != "N/A" else 0
+
+def get_max_dd(tearsheet):
+    return tearsheet['Max Drawdown (%)'] if tearsheet.get('Max Drawdown (%)', "N/A") != "N/A" else 0
 
 def calc_performance(tearsheet, trades):
     cagr = get_cagr(tearsheet)
     avg_dd = get_avg_dd(tearsheet)
-    trade_count = len(trades)
-    if trade_count < 50:
-        return -float('inf')
+    # avg_dd = get_max_dd(tearsheet)
+    # trade_count = len(trades)
+    # if trade_count < 50:
+    #     print("Insufficient trades:", trade_count)
+    #     return -float('inf')
     
     perf = (cagr / abs(avg_dd)) if avg_dd != 0 else -float('inf')
     return perf
@@ -390,23 +410,24 @@ def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct):
         elif v['type'] == 'categorical':
             params[k] = trial.suggest_categorical(k, v['choices'])
 
-    combined_params = {**params, **CONSTANT_PARAMS}
+    combined_params = {**CONSTANT_PARAMS, **params}
+    _, main_tearsheet, main_trades = backtest_worker((0, backtest_func, df, combined_params))  # Warm-up run to avoid first-run overhead
+    loss = -calc_performance(main_tearsheet, main_trades)
+    if np.isnan(loss) or np.isinf(loss):
+        return float('inf')
+    
     perturb_params = get_perturb_params(params, CONSTANT_PARAMS, perturb_pct)
-
-    all_params = [combined_params] + perturb_params
-
     results = []
-    with mp.Pool(processes=min(len(all_params), mp.cpu_count())) as pool:
-        args = [(i, backtest_func, df, param_set) for i, param_set in enumerate(all_params)]
+
+    with mp.Pool(processes=min(len(perturb_params), mp.cpu_count())) as pool:
+        args = [(i, backtest_func, df, param_set) for i, param_set in enumerate(perturb_params)]
         for result in pool.map(backtest_worker, args):
             results.append(result)
-        
-    _, main_tearsheet, main_trades = results[0]
-    
-    loss = -calc_performance(main_tearsheet, main_trades)
 
-    perturbed_loss = calc_perturb_loss(main_trades, results[1:])
+    perturbed_loss = calc_perturb_loss2(main_tearsheet, main_trades, results)
     loss += perturbed_loss
+    if np.isnan(loss) or np.isinf(loss):
+        return float('inf')
     
     cagr = get_cagr(main_tearsheet)
     avg_dd = get_avg_dd(main_tearsheet)
@@ -424,7 +445,7 @@ def optimize(backtest_func, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_eva
     pb.close()
     return study
 
-def grid_search(backtest_func, df, space, CONSTANT_PARAMS):
+def grid_search(backtest_func, df, space, CONSTANT_PARAMS, n_jobs=1):
     from itertools import product
 
     space_ranges = {}
@@ -434,7 +455,7 @@ def grid_search(backtest_func, df, space, CONSTANT_PARAMS):
     param_combinations = [dict(zip(space_ranges.keys(), v)) for v in product(*space_ranges.values())]
 
     results = {}
-    with mp.Pool(processes=min(len(param_combinations), mp.cpu_count())) as pool:
+    with mp.Pool(processes=min(n_jobs, mp.cpu_count())) as pool:
         args = [(idx, backtest_func, df, {**param_set, **CONSTANT_PARAMS}) for idx, param_set in enumerate(param_combinations)]
         for result in tqdm(pool.imap_unordered(backtest_worker, args), desc="Grid Search", total=len(args)):
             results[result[0]] = result
@@ -471,3 +492,60 @@ def grid_search(backtest_func, df, space, CONSTANT_PARAMS):
 
     fig.colorbar(surf, ax=ax, shrink=0.5, aspect=7)
     plt.show()
+
+def generate_wfo_splits(start_date: str, end_date: str, num_of_splits: int, 
+                         insample_ratio_size: float, outsample_ratio_size: float) -> list:
+    """
+    Generate a walk-forward optimization schedule with overlapping IS and OOS periods.
+    
+    Args:
+        start_date (str): Start date in 'YYYY-MM-DD' format.
+        end_date (str): End date in 'YYYY-MM-DD' format.
+        num_of_splits (int): Number of WFO splits (windows).
+        insample_ratio_size (float): Proportion of each split for IS (e.g., 0.75 for 3 months in a 4-month split).
+        outsample_ratio_size (float): Proportion of each split for OOS (e.g., 0.25 for 1 month in a 4-month split).
+    
+    Returns:
+        list: List of dictionaries, each containing 'is_start', 'is_end', 'oos_start', 'oos_end' as strings.
+    """
+    # Parse input dates
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    
+    # Validate inputs
+    if start >= end:
+        raise ValueError("start_date must be before end_date")
+    if num_of_splits < 1:
+        raise ValueError("num_of_splits must be at least 1")
+    if insample_ratio_size <= 0 or outsample_ratio_size <= 0:
+        raise ValueError("Ratios must be positive")
+    if abs(insample_ratio_size + outsample_ratio_size - 1.0) > 0.01:
+        raise ValueError("insample_ratio_size + outsample_ratio_size must sum to ~1.0")
+    
+    # Calculate r = IS/OOS ratio
+    r = insample_ratio_size / outsample_ratio_size
+    
+    # Calculate OOS and IS days to fit the period
+    total_days = (end - start).days
+    oos_days = total_days / (r + num_of_splits)
+    is_days = r * oos_days
+    
+    # Initialize result list
+    schedule = []
+    
+    # Generate splits with rolling windows
+    for i in range(num_of_splits):
+        is_start = start + pd.Timedelta(days=i * oos_days)
+        is_end = is_start + pd.Timedelta(days=is_days)
+        oos_start = is_end
+        oos_end = min(oos_start + pd.Timedelta(days=oos_days), end)
+        
+        # Store as strings in 'YYYY-MM-DD' format
+        schedule.append({
+            'is_start': is_start.strftime('%Y-%m-%d'),
+            'is_end': is_end.strftime('%Y-%m-%d'),
+            'oos_start': oos_start.strftime('%Y-%m-%d'),
+            'oos_end': oos_end.strftime('%Y-%m-%d')
+        })
+    
+    return schedule
