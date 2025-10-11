@@ -164,7 +164,7 @@ if __name__ == "__main__":
     end_date = dt.datetime.now()
     start_date = dt.datetime(2015, 1, 1)
 
-    file_paths = prepare_data(tickers, interval, start_date=start_date, end_date=end_date, path=data_path, overwrite=False)
+    file_paths = prepare_data(tickers, interval, start_date=start_date, end_date=end_date, path=data_path, update=False, overwrite=False)
     loaded_data = load_stock_data(file_paths, data_path, interval)
 
     df = pd.concat(loaded_data, names=["Stock", "Date"]).reset_index()
@@ -172,20 +172,21 @@ if __name__ == "__main__":
 
     CONSTANT_PARAMS = {
         'initial_capital': 500000,
-        'max_positions': 5,
+        'max_positions': 10,
         'brokerage': 0,
+        'min_trade_num': 50,
         'show_pb': False,
-        'start_date': '2024-10-01',
-        'end_date': '2025-06-01',
-        # 'start_date': '2022-12-01',
-        # 'end_date': '2023-03-03',
+        'start_date': '2020-01-01',
+        'end_date': '2021-01-01',
+        # 'start_date': '2025-02-15',
+        # 'end_date': '2025-10-14',
     }
 
     space = {
-        "bb_period": {"type": "int", "low": 10, "high": 150, 'step': 10},
-        "bb_sd": {"type": "float", "low": 1, "high": 4, 'step': 0.4},
+        "bb_period": {"type": "int", "low": 10, "high": 140, 'step': 10},
+        "bb_sd": {"type": "float", "low": 1, "high": 3.25, 'step': 0.25},
     }
 
-    wf_opt(CONSTANT_PARAMS, space, num_of_splits=57, insample_ratio_size=0.75, outsample_ratio_size=0.25)
+    wf_opt(CONSTANT_PARAMS, space, num_of_splits=4, insample_ratio_size=0.75, outsample_ratio_size=0.25)
     
-    # grid_search(backtest, df, space, CONSTANT_PARAMS, n_jobs=8)
+    # grid_search(backtest, df, space, CONSTANT_PARAMS, n_jobs=5)

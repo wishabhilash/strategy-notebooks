@@ -349,12 +349,29 @@ def backtest_worker(args):
     tearsheet, trades = backtest_func(df.copy(), pm, params, show_pb=params['show_pb'])
     return (idx, tearsheet, trades)
 
-def calc_perturb_loss2(base_tearsheet, base_trades, perturbed_results):
-    base_metric = calc_performance(base_tearsheet, base_trades)
+def calc_perturb_loss3(base_tearsheet, base_trades, perturbed_results, min_trade_num):
+    mo = calc_performance(base_tearsheet, base_trades, min_trade_num)
+    if mo == 0:  # Avoid division issues
+        return -float('inf')
+    
     perturbed_metrics = []
     for result in perturbed_results:
         _, tearsheet, trades = result
-        metric = calc_performance(tearsheet, trades)
+        metric = calc_performance(tearsheet, trades, min_trade_num)
+        perturbed_metrics.append(metric)
+
+    mp = np.mean(perturbed_metrics) if len(perturbed_metrics) > 1 else 0
+    vp = np.std(perturbed_metrics, ddof=1) if len(perturbed_metrics) > 1 else 0
+    ratio = mp / mo
+    penalty = mo * (ratio ** 1.5) * np.exp(-1.0 * vp)
+    return penalty
+
+def calc_perturb_loss2(base_tearsheet, base_trades, perturbed_results, min_trade_num):
+    base_metric = calc_performance(base_tearsheet, base_trades, min_trade_num)
+    perturbed_metrics = []
+    for result in perturbed_results:
+        _, tearsheet, trades = result
+        metric = calc_performance(tearsheet, trades, min_trade_num)
         perturbed_metrics.append(metric)
     metrics = [base_metric] + perturbed_metrics
 
@@ -364,7 +381,7 @@ def calc_perturb_loss2(base_tearsheet, base_trades, perturbed_results):
         return -float('inf')
     return stability_penalty
 
-def calc_perturb_loss(base_tearsheet, base_trades, perturbed_results):
+def calc_perturb_loss(base_tearsheet, base_trades, perturbed_results, min_trade_num):
     base_metric = base_trades['returns'].mean() if len(base_trades) > 0 else 0
     perturbed_metrics = []
     for result in perturbed_results:
@@ -387,19 +404,20 @@ def get_avg_dd(tearsheet):
 def get_max_dd(tearsheet):
     return tearsheet['Max Drawdown (%)'] if tearsheet.get('Max Drawdown (%)', "N/A") != "N/A" else 0
 
-def calc_performance(tearsheet, trades):
+def calc_performance(tearsheet, trades, min_trade_num=50):
     cagr = get_cagr(tearsheet)
     avg_dd = get_avg_dd(tearsheet)
     # avg_dd = get_max_dd(tearsheet)
-    # trade_count = len(trades)
-    # if trade_count < 50:
-    #     print("Insufficient trades:", trade_count)
-    #     return -float('inf')
+    trade_count = len(trades)
+    if trade_count < min_trade_num:
+        print("Insufficient trades:", trade_count)
+        return -float('inf')
     
     perf = (cagr / abs(avg_dd)) if avg_dd != 0 else -float('inf')
+    # perf = cagr
     return perf
 
-def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct):
+def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct, min_trade_num):
     # Build param dict using Optuna's suggest API
     params = {}
     for k, v in space.items():
@@ -412,9 +430,9 @@ def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct):
 
     combined_params = {**CONSTANT_PARAMS, **params}
     _, main_tearsheet, main_trades = backtest_worker((0, backtest_func, df, combined_params))  # Warm-up run to avoid first-run overhead
-    loss = -calc_performance(main_tearsheet, main_trades)
-    if np.isnan(loss) or np.isinf(loss):
-        return float('inf')
+    # loss = -calc_performance(main_tearsheet, main_trades, min_trade_num)
+    # if np.isnan(loss) or np.isinf(loss):
+    #     return float('inf')
     
     perturb_params = get_perturb_params(params, CONSTANT_PARAMS, perturb_pct)
     results = []
@@ -424,20 +442,20 @@ def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct):
         for result in pool.map(backtest_worker, args):
             results.append(result)
 
-    perturbed_loss = calc_perturb_loss2(main_tearsheet, main_trades, results)
-    loss += perturbed_loss
+    loss = -calc_perturb_loss3(main_tearsheet, main_trades, results, min_trade_num)
+    # loss += perturbed_loss
     if np.isnan(loss) or np.isinf(loss):
         return float('inf')
     
     cagr = get_cagr(main_tearsheet)
     avg_dd = get_avg_dd(main_tearsheet)
-    print(f"cagr: {cagr}, avg_dd: {avg_dd}, loss: {loss}, perturbed_loss: {perturbed_loss}")
+    print(f"cagr: {cagr}, avg_dd: {avg_dd}, loss: {loss}")
     return loss
 
-def optimize(backtest_func, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_evals=100, n_jobs=1):
+def optimize(backtest_func, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_evals=100, n_jobs=1, min_trade_num=50):
     pb = tqdm(total=max_evals, desc="Optimizing")
     def optuna_obj(trial):
-        result = objective(trial, backtest_func, df.copy(), CONSTANT_PARAMS, space, perturb_pct)
+        result = objective(trial, backtest_func, df.copy(), CONSTANT_PARAMS, space, perturb_pct, min_trade_num)
         pb.update(1)
         return result
     study = optuna.create_study(direction='minimize')
@@ -464,7 +482,7 @@ def grid_search(backtest_func, df, space, CONSTANT_PARAMS, n_jobs=1):
     rows = []
     for idx, param in enumerate(param_combinations):
         _, tearsheet, trades = results[idx]
-        perf = calc_performance(tearsheet, trades)
+        perf = calc_performance(tearsheet, trades, min_trade_num=CONSTANT_PARAMS.get('min_trade_num', 50))
         keys = sorted(param.keys())
         row = {keys[0]: param[keys[0]], keys[1]: param[keys[1]], "performance": perf}
         rows.append(row)

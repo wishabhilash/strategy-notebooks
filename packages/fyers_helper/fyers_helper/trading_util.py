@@ -8,7 +8,7 @@ import datetime as dt
 
 
 def prepare_data(tickers: List[str], interval: str, start_date: dt.datetime, 
-                 end_date: dt.datetime, path: str, overwrite: bool = False, show_progress = True) -> Dict[str, pd.DataFrame]:
+                 end_date: dt.datetime, path: str, overwrite: bool = False, update=False, show_progress = True) -> Dict[str, pd.DataFrame]:
     file_paths = {}
     config = json.loads(os.environ['FYERS_CONFIG'])
     
@@ -29,6 +29,10 @@ def prepare_data(tickers: List[str], interval: str, start_date: dt.datetime,
         file_path = f'{path}/{ticker}-{interval}m-EQ.parquet'
         if os.path.exists(file_path):
             if not overwrite:
+                file_paths[ticker] = file_path
+                if not update:
+                    pb.update(1)
+                    continue
                 file_paths[ticker] = file_path
                 existing_data = pd.read_parquet(file_path)
                 new_date = existing_data.tail(1).iloc[0].name.date() + dt.timedelta(days=1)
