@@ -1,13 +1,13 @@
 from dataclasses import dataclass, field, asdict
 from typing import List
 import pandas as pd
-import matplotlib.pyplot as plt
 import copy
 from tqdm.notebook import tqdm
 import multiprocessing as mp
 import optuna
 import numpy as np
-import copy
+import datetime as dt
+import os
 
 
 class Bank:
@@ -314,6 +314,8 @@ def show_equity_curve(trades: pd.DataFrame):
     trades['exit_year'] = trades['exit_time'].dt.year
     yearly_pnl = trades.groupby('exit_year')['pnl'].sum()
 
+    import matplotlib.pyplot as plt
+
     plt.figure(figsize=(10, 6))
     yearly_pnl.plot(kind='bar', edgecolor='black')
     plt.title('Year-wise PnL')
@@ -499,6 +501,7 @@ def grid_search(backtest_func, df, space, CONSTANT_PARAMS, n_jobs=1):
     # Create meshgrid for X and Y
     X, Y = np.meshgrid(x_unique, y_unique, indexing='ij')
 
+    import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(10,8))
     ax = fig.add_subplot(111, projection='3d')
     surf = ax.plot_surface(X, Y, Z, cmap='viridis', edgecolor='none')
@@ -527,8 +530,8 @@ def generate_wfo_splits(start_date: str, end_date: str, num_of_splits: int,
         list: List of dictionaries, each containing 'is_start', 'is_end', 'oos_start', 'oos_end' as strings.
     """
     # Parse input dates
-    start = pd.to_datetime(start_date)
-    end = pd.to_datetime(end_date)
+    start = dt.datetime.strptime(start_date, '%Y-%m-%d')
+    end = dt.datetime.strptime(end_date, '%Y-%m-%d')
     
     # Validate inputs
     if start >= end:
@@ -553,10 +556,10 @@ def generate_wfo_splits(start_date: str, end_date: str, num_of_splits: int,
     
     # Generate splits with rolling windows
     for i in range(num_of_splits):
-        is_start = start + pd.Timedelta(days=i * oos_days)
-        is_end = is_start + pd.Timedelta(days=is_days)
+        is_start = start + dt.timedelta(days=i * oos_days)
+        is_end = is_start + dt.timedelta(days=is_days)
         oos_start = is_end
-        oos_end = min(oos_start + pd.Timedelta(days=oos_days), end)
+        oos_end = min(oos_start + dt.timedelta(days=oos_days), end)
         
         # Store as strings in 'YYYY-MM-DD' format
         schedule.append({
@@ -567,3 +570,55 @@ def generate_wfo_splits(start_date: str, end_date: str, num_of_splits: int,
         })
     
     return schedule
+
+def walkforward_optimisation(backtest_func, df, params, space, num_of_splits, out_path, insample_ratio_size=0.75, outsample_ratio_size=0.25):
+    all_trades = []
+    all_tearsheets = []
+    splits = generate_wfo_splits(
+        start_date=params['start_date'], 
+        end_date=params['end_date'], 
+        num_of_splits=num_of_splits, 
+        insample_ratio_size=insample_ratio_size, 
+        outsample_ratio_size=outsample_ratio_size
+    )
+    for split in splits:
+        filename = f"{out_path}/trades/{split['oos_start']}_{split['oos_end']}.csv"
+        if os.path.exists(filename):
+            all_trades.append(pd.read_csv(filename))
+            print(f"File {filename} exists, skipping...")
+            continue
+        print(split)
+        params = copy(params)
+        params['start_date'] = split['is_start']
+        params['end_date'] = split['is_end']
+        for i in range(1, 4):
+            study = optimize(backtest_func, df, space, params, perturb_pct=0.1, max_evals=i*30, n_jobs=2)
+            if not np.isinf(study.best_value):
+                break
+            print("Retrying optimization with more evaluations...")
+
+        if study.best_value > 0:
+            print(f"All perturbations resulted in performance of loss, skipping this split - {split}.")
+            continue
+        params = copy(params)
+        params['start_date'] = split['oos_start']
+        params['end_date'] = split['oos_end']
+        params.update(study.best_params)
+        if len(all_tearsheets) > 0:
+            params['initial_capital'] = all_tearsheets[-1]['Final capital']
+
+        _, tearsheet, trades = backtest_worker((0, backtest_func, df, params))
+        trades.to_csv(filename, index=False)
+        all_trades.append(trades)
+        all_tearsheets.append(tearsheet)
+
+
+    all_trades_df = pd.concat(all_trades).reset_index(drop=True)
+    final_tearsheet, final_trades = generate_tearsheet(params['initial_capital'], None, trades=all_trades_df)
+
+    print(pd.DataFrame({
+        "Metrics": final_tearsheet.keys(),
+        "Values": final_tearsheet.values(),
+    }))
+    show_equity_curve(final_trades)
+

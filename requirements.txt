@@ -5,6 +5,6 @@ pyarrow==21.0.0
 torch==2.6.0
 torchvision==0.21.0
 tqdm==4.66.4
-fyers_helper
-TA-Lib 
-lxml
+fyers_helper==0.1.9
+TA-Lib==0.6.6
+lxml==6.0.1
