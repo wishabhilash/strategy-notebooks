@@ -348,7 +348,7 @@ def backtest_worker(args):
     idx, backtest_func, df, params = args
     bank = Bank(params['initial_capital'])
     pm = PositionManager(bank, brokerage=params['brokerage'])
-    tearsheet, trades = backtest_func(df.copy(), pm, params, show_pb=params['show_pb'])
+    tearsheet, trades = backtest_func(df, pm, params, show_pb=params['show_pb'])
     return (idx, tearsheet, trades)
 
 def calc_perturb_loss3(base_tearsheet, base_trades, perturbed_results, min_trade_num):
@@ -457,7 +457,7 @@ def objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct, min
 def optimize(backtest_func, df, space, CONSTANT_PARAMS, perturb_pct=0.1, max_evals=100, n_jobs=1, min_trade_num=50):
     pb = tqdm(total=max_evals, desc="Optimizing")
     def optuna_obj(trial):
-        result = objective(trial, backtest_func, df.copy(), CONSTANT_PARAMS, space, perturb_pct, min_trade_num)
+        result = objective(trial, backtest_func, df, CONSTANT_PARAMS, space, perturb_pct, min_trade_num)
         pb.update(1)
         return result
     study = optuna.create_study(direction='minimize')

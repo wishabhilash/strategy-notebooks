@@ -1,9 +1,6 @@
-from copy import copy
-import os
 import pandas as pd
-from fyers_helper import prepare_data, load_stock_data
+from fyers_helper import prepare_data, load_stock_data, PositionManager, generate_tearsheet, grid_search, walkforward_optimisation
 import datetime as dt
-from lib import PositionManager, generate_tearsheet, grid_search, walkforward_optimisation
 import talib as ta
 from tqdm.notebook import tqdm
 import numpy as np
